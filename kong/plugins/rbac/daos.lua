@@ -3,7 +3,7 @@ local utils = require "kong.tools.utils"
 local RESOURCE_SCHEMA = {
   primary_key = { "id" },
   table = "rbac_resources",
-  cache_key = { "api_id", "method", "upstream_path" },
+  cache_key = { "api_id" },
   fields = {
     id = { type = "id", dao_insert_value = true },
     api_id = { type = "uuid", required = true, foreign = "apis:id" },

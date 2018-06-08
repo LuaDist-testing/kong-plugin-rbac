@@ -57,10 +57,10 @@ return {
       type = "boolean",
       default = false,
     },
-    --run_on_preflight = {
-    --  type = "boolean",
-    --  default = true,
-    --},
+    run_on_preflight = {
+      type = "boolean",
+      default = true,
+    },
     rbac_enabled = {
       type = "boolean",
       default = true

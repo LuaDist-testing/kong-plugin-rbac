@@ -3,6 +3,8 @@ local constants = require "kong.constants"
 local singletons = require "kong.singletons"
 local public_tools = require "kong.tools.public"
 local BasePlugin = require "kong.plugins.base_plugin"
+local _ = require "lodash"
+local router = require "router"
 
 local ngx_set_header = ngx.req.set_header
 local ngx_get_headers = ngx.req.get_headers
@@ -47,6 +49,44 @@ local function load_consumer(consumer_id, anonymous)
   end
   return result
 end
+local function load_api_resources(api_id)
+  local cache = singletons.cache
+  local dao = singletons.dao
+  local resources_cache_key = dao.rbac_resources:cache_key(api_id)
+  local resources, err = cache:get(resources_cache_key, nil, (function(id)
+    return dao.rbac_resources:find_all({ api_id = id })
+  end), api_id)
+  if err then
+    return responses.send_HTTP_INTERNAL_SERVER_ERROR(err)
+  end
+  return resources
+end
+local function load_consumer_resources(consumer_id)
+  local cache = singletons.cache
+  local dao = singletons.dao
+  local role_cache_key = dao.rbac_role_consumers:cache_key(consumer_id)
+  local roles, err = cache:get(role_cache_key, nil, (function(id)
+    return dao.rbac_role_consumers:find_all({ consumer_id = id })
+  end), consumer_id)
+  if err then
+    return responses.send_HTTP_INTERNAL_SERVER_ERROR(err)
+  end
+  if table.getn(roles) < 1 then
+    return {}
+  end
+  local resources = {}
+  _.forEach(roles, (function(role)
+    local role_resource_cache_key = dao.rbac_role_resources:cache_key(role.role_id)
+    local role_resources, role_resource_err = cache:get(role_resource_cache_key, nil, (function(role_id)
+      return dao.rbac_role_resources:find_all({ role_id = role_id })
+    end), role.role_id)
+    if role_resource_err then
+      return responses.send_HTTP_INTERNAL_SERVER_ERROR(role_resource_err)
+    end
+    resources = _.union(resources, role_resources)
+  end))
+  return resources
+end
 
 local function set_consumer(consumer, credential)
   ngx_set_header(constants.HEADERS.CONSUMER_ID, consumer.id)
@@ -62,7 +102,29 @@ local function set_consumer(consumer, credential)
   end
 
 end
-
+local function do_rbac(consumer, api)
+  local api_resources = load_api_resources(api.id)
+  if table.getn(api_resources) < 1 then
+    return true
+  end
+  local consumer_resources = load_consumer_resources(consumer.id)
+  local r = router.new()
+  local ok = false
+  local matched_protected_resource = false
+  _.forEach(api_resources, (function(resource)
+    r:match(string.upper(resource.method), resource.upstream_path, function()
+      _.forEach(consumer_resources, (function(consumer_resource)
+        matched_protected_resource = true
+        ok = consumer_resource.resource_id == resource.id
+      end))
+    end)
+  end))
+  r:execute(get_method(), string.sub(ngx.var.uri, string.len(ngx.ctx.router_matches.uri) + 1))
+  if not matched_protected_resource then
+    ok = true
+  end
+  return ok
+end
 local function do_authentication(conf)
   if type(conf.key_names) ~= "table" then
     ngx.log(ngx.ERR, "[rbac] no conf.key_names set, aborting plugin execution")
@@ -126,10 +188,10 @@ local function do_authentication(conf)
   local dao = singletons.dao
 
   local credential_cache_key = dao.rbac_credentials:cache_key(key)
-  local credential, err = cache:get(credential_cache_key, nil,
+  local credential, credential_err = cache:get(credential_cache_key, nil,
     load_credential, key)
-  if err then
-    return responses.send_HTTP_INTERNAL_SERVER_ERROR(err)
+  if credential_err then
+    return responses.send_HTTP_INTERNAL_SERVER_ERROR(credential_err)
   end
 
   -- no credential in DB, for this key, it is invalid, HTTP 403
@@ -141,7 +203,6 @@ local function do_authentication(conf)
   if credential.expired_at and credential.expired_at <= (os.time() * 1000) then
     return false, { status = 403, message = "Invalid authentication credentials" }
   end
-
   -----------------------------------------
   -- Success, this request is authenticated
   -----------------------------------------
@@ -157,7 +218,7 @@ local function do_authentication(conf)
 
   set_consumer(consumer, credential)
 
-  return true
+  return consumer
 end
 
 function RBACAuthHandler:access(conf)
@@ -174,20 +235,30 @@ function RBACAuthHandler:access(conf)
     return
   end
 
-  local ok, err = do_authentication(conf)
-  if not ok then
+  local consumer, err = do_authentication(conf)
+  if not consumer then
     if conf.anonymous ~= "" then
       -- get anonymous user
       local consumer_cache_key = singletons.dao.consumers:cache_key(conf.anonymous)
-      local consumer, err = singletons.cache:get(consumer_cache_key, nil,
+      local anonymous_err
+      consumer, anonymous_err = singletons.cache:get(consumer_cache_key, nil,
         load_consumer,
         conf.anonymous, true)
-      if err then
-        responses.send_HTTP_INTERNAL_SERVER_ERROR(err)
+      if anonymous_err then
+        responses.send_HTTP_INTERNAL_SERVER_ERROR(anonymous_err)
       end
       set_consumer(consumer, nil)
     else
       return responses.send(err.status, err.message)
+    end
+  end
+  if conf.rbac_enabled and consumer then
+    local ok, rbac_err = do_rbac(consumer, ngx.ctx.api)
+    if rbac_err then
+      return responses.send_HTTP_INTERNAL_SERVER_ERROR(rbac_err)
+    end
+    if not ok then
+      return responses.send_HTTP_FORBIDDEN('Access denied.')
     end
   end
 end
